@@ -109,6 +109,65 @@ class ChatwootService {
         this.handleError(err);
     }
   }
+
+  // --- M2/M3: STAGING & BOARDS DISPATCH --- //
+
+  async getSystemBoards() {
+    try {
+      // Mock do acesso de boards (custom API da fazer.ai?)
+      // Adaptar conforme a real URL da documentação deles.
+      const cfg = this._getAxiosConfig();
+      const result = await axios.get(`/api/v1/accounts/${process.env.ACCOUNT_ID}/custom_boards`, cfg);
+      // Fallback em caso de erro formatado
+      return result.data.payload || result.data || [];
+    } catch (err) {
+      // Para fins de dev sem crashar cron:
+      console.log('Aviso (Mock): falha ao obter boards reais.', err.message);
+      return []; 
+    }
+  }
+
+  async createLeadFlow(leadData, boardId, stepId, assigneeId) {
+     const cfg = this._getAxiosConfig();
+     const actId = process.env.ACCOUNT_ID;
+     
+     // Passo 1: Criar Contato
+     const contactRes = await axios.post(`/api/v1/accounts/${actId}/contacts`, {
+         inbox_id: null,
+         name: leadData.name,
+         email: leadData.email,
+         phone_number: leadData.phone
+     }, cfg);
+     const contact = contactRes.data.payload.contact || contactRes.data;
+
+     // Passo 2: POST Endpoints de tasks do board -> cria tarefa
+     // Esse endpoint e custom (fazer.ai especifico CRM)
+     const taskRes = await axios.post(`/api/v1/accounts/${actId}/boards/${boardId}/tasks`, {
+         title: contact.name,
+         description: 'Importado via Staging CSV'
+     }, cfg);
+     const task = taskRes.data.payload || taskRes.data;
+
+     // Passo 3: PATCH Associa a tarefa ao contato criado
+     await axios.patch(`/api/v1/accounts/${actId}/tasks/${task.id}`, {
+         contact_id: contact.id
+     }, cfg);
+
+     // Passo 4: PATCH Define o step inicial conforme o board selecionado
+     await axios.patch(`/api/v1/accounts/${actId}/tasks/${task.id}/step`, {
+         step_id: stepId
+     }, cfg);
+
+     // Passo 5: PATCH Atribui o agente
+     if (assigneeId) {
+         await axios.patch(`/api/v1/accounts/${actId}/tasks/${task.id}/assignee`, {
+             assignee_id: assigneeId
+         }, cfg);
+     }
+
+     return { contact, task };
+  }
+
 }
 
 module.exports = new ChatwootService();

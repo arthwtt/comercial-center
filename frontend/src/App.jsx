@@ -2,6 +2,7 @@ import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import ConnectionPage from './pages/Settings/ConnectionPage';
 import KanbanBoard from './pages/Kanban/KanbanBoard';
+import LeadsStaging from './pages/Staging/LeadsStaging';
 import Sidebar from './components/Layout/Sidebar';
 
 function App() {
@@ -13,6 +14,7 @@ function App() {
           <Routes>
             <Route path="/" element={<Navigate to="/kanban" replace />} />
             <Route path="/kanban" element={<KanbanBoard />} />
+            <Route path="/staging" element={<LeadsStaging />} />
             <Route path="/settings/connection" element={<ConnectionPage />} />
           </Routes>
         </main>

@@ -1,0 +1,53 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Board {
+  id        String    @id
+  name      String
+  synced_at DateTime  @default(now())
+  steps     Step[]
+}
+
+model Step {
+  id        String   @id
+  board_id  String
+  name      String
+  position  Int
+  board     Board    @relation(fields: [board_id], references: [id], onDelete: Cascade)
+}
+
+enum LeadStatus {
+  pending
+  dispatched
+  skipped
+}
+
+enum LeadOrigin {
+  csv
+  manual
+}
+
+model LeadStaging {
+  id         String     @id @default(uuid())
+  name       String
+  email      String?
+  phone      String?
+  status     LeadStatus @default(pending)
+  origin     LeadOrigin @default(manual)
+  created_at DateTime   @default(now())
+}
+
+model Dispatch {
+  id              String   @id @default(uuid())
+  admin_id        String?
+  lead_count      Int
+  target_agent_id Int?
+  target_board_id String
+  created_at      DateTime @default(now())
+}

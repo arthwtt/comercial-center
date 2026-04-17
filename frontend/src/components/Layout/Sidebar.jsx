@@ -4,7 +4,8 @@ import { LayoutDashboard, Settings } from 'lucide-react';
 
 export default function Sidebar() {
   const menu = [
-    { name: 'Kanban M1', path: '/kanban', icon: LayoutDashboard },
+    { name: 'Dashboard M1', path: '/kanban', icon: LayoutDashboard },
+    { name: 'Upload & Staging', path: '/staging', icon: Settings },
     { name: 'Conexão M0', path: '/settings/connection', icon: Settings },
   ];
 
