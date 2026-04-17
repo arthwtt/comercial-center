@@ -1,11 +1,11 @@
-import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, Settings } from 'lucide-react';
+import { LayoutDashboard, Settings, Users } from 'lucide-react';
 
 export default function Sidebar() {
   const menu = [
     { name: 'Dashboard M1', path: '/kanban', icon: LayoutDashboard },
     { name: 'Upload & Staging', path: '/staging', icon: Settings },
+    { name: 'Equipe & Reports', path: '/agents', icon: Users },
     { name: 'Conexão M0', path: '/settings/connection', icon: Settings },
   ];
 

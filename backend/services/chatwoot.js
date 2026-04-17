@@ -168,6 +168,36 @@ class ChatwootService {
      return { contact, task };
   }
 
+  // --- MÓDULO OPN: REPORTS V2 --- //
+
+  async getAgentReports(since, until) {
+     try {
+       const actId = process.env.ACCOUNT_ID;
+       const cfg = this._getAxiosConfig();
+       
+       // Puxando conversas abertas e load (M1 já tem getConversations, mas agrupar por assignee é util aqui)
+       const loadRes = await axios.get(`/api/v1/accounts/${actId}/conversations`, {
+           ...cfg,
+           params: { assignee_type: 'assigned', status: 'open' }
+       });
+       const activeConvs = loadRes.data?.data?.payload || [];
+
+       // Puxando Performance de relatorios
+       const reportsRes = await axios.get(`/api/v2/accounts/${actId}/reports/agents/summary`, {
+           ...cfg,
+           params: { since, until }
+       });
+       
+       return {
+           activeLoad: activeConvs,
+           performance: reportsRes.data
+       };
+     } catch(e) {
+       console.log('Falha em relatórios (Mocks para testes se Fazer.ai falhar):', e.message);
+       return { activeLoad: [], performance: [] };
+     }
+  }
+
 }
 
 module.exports = new ChatwootService();
