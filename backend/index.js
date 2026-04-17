@@ -9,7 +9,10 @@ app.use(cors());
 app.use(express.json());
 
 const chatwootRoutes = require('./routes/chatwoot');
+const kanbanRoutes = require('./routes/kanban');
+
 app.use('/api/config', chatwootRoutes);
+app.use('/api/kanban', kanbanRoutes);
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
