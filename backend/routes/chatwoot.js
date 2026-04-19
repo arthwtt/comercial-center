@@ -3,6 +3,7 @@ const router = express.Router();
 const fs = require('fs');
 const path = require('path');
 const chatwootService = require('../services/chatwoot');
+const { readCommercialConfig, saveCommercialConfig } = require('../utils/commercialConfig');
 
 // POST /api/config/test
 router.post('/test', async (req, res) => {
@@ -51,6 +52,35 @@ router.get('/status', async (req, res) => {
     res.json(status);
   } catch (error) {
     res.status(500).json({ error: 'Erro ao validar status.' });
+  }
+});
+
+// GET /api/config/commercial-mapping
+router.get('/commercial-mapping', async (_req, res) => {
+  try {
+    res.json({ success: true, data: readCommercialConfig() });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erro ao carregar mapeamento comercial.' });
+  }
+});
+
+// POST /api/config/commercial-mapping
+router.post('/commercial-mapping', async (req, res) => {
+  try {
+    const mapping = saveCommercialConfig(req.body || {});
+    res.json({ success: true, data: mapping });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erro ao salvar mapeamento comercial.' });
+  }
+});
+
+// GET /api/config/boards-preview
+router.get('/boards-preview', async (_req, res) => {
+  try {
+    const boards = await chatwootService.getSystemBoards();
+    res.json({ success: true, data: boards });
+  } catch (error) {
+    res.status(500).json({ success: false, error: 'Erro ao carregar boards do Chatwoot.' });
   }
 });
 

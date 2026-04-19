@@ -6,10 +6,46 @@ const fs = require('fs');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const chatwootService = require('../services/chatwoot');
+const { normalizeLeadInput } = require('../utils/leadNormalization');
 
 // Usa /tmp ou pasta local pra uploads
 const uploadDir = require('os').tmpdir();
 const upload = multer({ dest: uploadDir });
+
+async function createStagingLeadFromInput(rawLead, origin = 'manual') {
+    const normalized = normalizeLeadInput(rawLead);
+    if (!normalized.name) {
+        return { inserted: false, skipped: true, reason: 'missing_name' };
+    }
+
+    if (!normalized.phone && !normalized.email) {
+        return { inserted: false, skipped: true, reason: 'missing_contact' };
+    }
+
+    let isDuplicate = false;
+    try {
+        const existing = await chatwootService.findExistingContact({
+            phone: normalized.phone,
+            email: normalized.email,
+            name: normalized.name,
+        });
+        isDuplicate = Boolean(existing);
+    } catch (_error) {
+        isDuplicate = false;
+    }
+
+    await prisma.leadStaging.create({
+        data: {
+            name: normalized.name,
+            email: normalized.email,
+            phone: normalized.phone,
+            status: isDuplicate ? 'skipped' : 'pending',
+            origin,
+        }
+    });
+
+    return { inserted: !isDuplicate, skipped: isDuplicate, reason: isDuplicate ? 'duplicate' : null };
+}
 
 // POST /api/leads/import
 router.post('/import', upload.single('file'), async (req, res) => {
@@ -26,38 +62,27 @@ router.post('/import', upload.single('file'), async (req, res) => {
             let skipped = 0;
 
             for (const row of results) {
-                // Tentativa de normalizar colunas por headers padrao
-                const name = row.name || row.Nome || row.NAME || row.nome;
-                const email = row.email || row.Email || row.EMAIL || row.email || null;
-                const phone = row.phone || row.Phone || row.PHONE || row.telefone || row.Telefone || null;
-                
-                if (!name) {
-                    skipped++;
-                    continue; // Sem nome, sem lead
-                }
-
                 try {
-                   // Busca duplicatas
-                   let query = phone || email || name;
-                   const searchResult = await chatwootService.searchContacts(query);
-                   const isDuplicate = searchResult?.payload?.length > 0;
-
-                   await prisma.leadStaging.create({
-                       data: {
-                           name, email, phone,
-                           status: isDuplicate ? 'skipped' : 'pending',
-                           origin: 'csv'
-                       }
-                   });
-
-                   if(isDuplicate) skipped++; else inserted++;
-                } catch(e) {
+                   const result = await createStagingLeadFromInput(row, 'csv');
+                   if (result.inserted) inserted++;
+                   if (result.skipped) skipped++;
+                } catch(_e) {
                    skipped++;
                 }
             }
 
             res.json({ success: true, metrics: { inserted, skipped } });
         });
+});
+
+// POST /api/leads/manual
+router.post('/manual', async (req, res) => {
+    try {
+        const result = await createStagingLeadFromInput(req.body || {}, 'manual');
+        res.json({ success: true, data: result });
+    } catch (e) {
+        res.status(500).json({ success: false, error: e.message });
+    }
 });
 
 // GET /api/leads/staging

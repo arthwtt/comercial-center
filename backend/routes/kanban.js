@@ -12,10 +12,11 @@ router.get('/conversations', async (req, res) => {
   }
 });
 
-// Retorna todas a labels para popular as colunas do Kanban
-router.get('/labels', async (req, res) => {
+// Retorna lista de tasks (CRM Boards)
+router.get('/tasks', async (req, res) => {
   try {
-    const data = await chatwootService.getLabels();
+    const { board_id } = req.query;
+    const data = await chatwootService.getTasks(board_id);
     res.json({ success: true, data });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
