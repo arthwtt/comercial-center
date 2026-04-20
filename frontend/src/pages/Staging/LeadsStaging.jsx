@@ -183,7 +183,7 @@ export default function LeadsStaging() {
 
           <input
             type="file"
-            accept=".csv"
+            accept=".csv,.xlsx,.xls"
             id="csv-upload"
             className="hidden"
             onChange={(e) => {
@@ -194,7 +194,7 @@ export default function LeadsStaging() {
             }}
           />
           <label htmlFor="csv-upload" className="cursor-pointer rounded-xl bg-slate-700 px-5 py-2.5 text-white shadow-lg transition-colors hover:bg-slate-600">
-            {file ? file.name : 'Localizar .CSV'}
+            {file ? file.name : 'Localizar .CSV ou .XLSX'}
           </label>
 
           {file && (

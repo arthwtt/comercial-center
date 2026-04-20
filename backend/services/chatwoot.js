@@ -394,12 +394,14 @@ class ChatwootService {
          throw new Error('Nenhum inbox do Chatwoot dispon?vel para criar o contato. Configure DEFAULT_INBOX_ID ou verifique os inboxes da conta.');
        }
 
-       const contactRes = await axios.post(`/api/v1/accounts/${actId}/contacts`, {
-         inbox_id: inboxId,
-         name: leadData.name,
-         email: normalizedEmail,
-         phone_number: normalizedPhone
-       }, cfg);
+        const contactRes = await axios.post(`/api/v1/accounts/${actId}/contacts`, {
+          inbox_id: inboxId,
+          name: leadData.name,
+          email: normalizedEmail,
+          phone_number: normalizedPhone,
+          identifier: leadData.identifier || null,
+          custom_attributes: leadData.customAttributes || {}
+        }, cfg);
        contact = this._firstItem(contactRes.data) || contactRes.data?.payload?.contact || contactRes.data?.payload || contactRes.data;
      }
 
