@@ -6,6 +6,7 @@ import KanbanColumn from '../../components/Kanban/KanbanColumn';
 
 export default function KanbanBoard() {
   const [selectedAgent, setSelectedAgent] = useState('');
+  const [selectedBoardId, setSelectedBoardId] = useState('');
   const [refreshInterval, setRefreshInterval] = useState(30000); // 30s by default
 
   const { data: configData } = useQuery({
@@ -16,13 +17,12 @@ export default function KanbanBoard() {
     }
   });
 
-  const { data: labelsData } = useQuery({
-    queryKey: ['labels'],
+  const { data: boardsData } = useQuery({
+    queryKey: ['system_boards'],
     queryFn: async () => {
-      const res = await api.get('/kanban/labels');
+      const res = await api.get('/boards');
       return res.data.data;
-    },
-    enabled: !!configData?.active
+    }
   });
 
   const { data: agentsData } = useQuery({
@@ -34,14 +34,18 @@ export default function KanbanBoard() {
     enabled: !!configData?.active
   });
 
-  const { data: conversationsData, isFetching, refetch } = useQuery({
-    queryKey: ['conversations'],
+  // Autoselect first board if none selected
+  if (boardsData && boardsData.length > 0 && !selectedBoardId) {
+     setSelectedBoardId(boardsData[0].id.toString());
+  }
+
+  const { data: tasksData, isFetching, refetch } = useQuery({
+    queryKey: ['tasks', selectedBoardId],
     queryFn: async () => {
-      // Chatwoot default is all open instances
-      const res = await api.get('/kanban/conversations');
+      const res = await api.get(`/kanban/tasks?board_id=${selectedBoardId}`);
       return res.data.data; 
     },
-    enabled: !!configData?.active,
+    enabled: !!configData?.active && !!selectedBoardId,
     refetchInterval: refreshInterval > 0 ? refreshInterval : false,
   });
 
@@ -49,41 +53,23 @@ export default function KanbanBoard() {
     return (
       <div className="flex items-center justify-center h-full animate-fade-in">
          <div className="text-center p-8 bg-slate-900 border border-slate-800 rounded-3xl max-w-sm shadow-2xl">
-            <div className="w-16 h-16 bg-red-500/10 text-red-400 rounded-2xl flex items-center justify-center mx-auto mb-4 border border-red-500/20">
-               <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
-            </div>
             <h2 className="text-xl font-bold text-slate-200">Não configurado</h2>
             <p className="text-slate-400 mt-2 text-sm leading-relaxed">
-               O Painel Kanban precisa da conexão ativa do Chatwoot no Módulo 0. Volte ao menu de configurações e defina as chaves de acesso.
+               Conecte o Chatwoot no Módulo 0.
             </p>
          </div>
       </div>
     );
   }
 
-  // Filter conversations
-  const conversations = conversationsData?.payload || [];
-  const filteredConversations = selectedAgent
-    ? conversations.filter(c => c.meta?.assignee?.id === Number(selectedAgent))
-    : conversations;
+  // Filter tasks
+  const tasks = tasksData || [];
+  const filteredTasks = selectedAgent
+    ? tasks.filter(t => t.assigned_agents?.some(a => a.id === Number(selectedAgent)))
+    : tasks;
 
-  const defaultLabels = [
-    { title: 'novo-lead', color: '#4A90E2' },
-    { title: 'qualificado', color: '#F5A623' },
-    { title: 'proposta', color: '#7B68EE' },
-    { title: 'fechado', color: '#2ECC71' },
-    { title: 'perdido', color: '#E74C3C' },
-  ];
-
-  const boardLabels = labelsData?.payload || [];
-  
-  const columns = defaultLabels.map(l => {
-    const cwLabel = boardLabels.find(bl => bl.title.toLowerCase() === l.title.toLowerCase());
-    return {
-      title: l.title,
-      color: cwLabel?.color || l.color
-    }
-  });
+  const currentBoard = boardsData?.find(b => b.id.toString() === selectedBoardId);
+  const steps = currentBoard?.steps || [];
 
   return (
     <div className="h-full flex flex-col animate-fade-in relative z-10">
@@ -92,23 +78,25 @@ export default function KanbanBoard() {
          agents={agentsData || []}
          selectedAgent={selectedAgent}
          setSelectedAgent={setSelectedAgent}
+         boards={boardsData || []}
+         selectedBoardId={selectedBoardId}
+         setSelectedBoardId={setSelectedBoardId}
          refreshInterval={refreshInterval}
          setRefreshInterval={setRefreshInterval}
          onManualRefresh={() => refetch()}
          isFetching={isFetching}
       />
       
-      <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-5 pb-4 custom-scrollbar">
-        {columns.map(col => {
-          // Filtragem baseada em substrings ou matches ideiais de label
-          const colConversations = filteredConversations.filter(c => c.labels.includes(col.title));
+      <div className="flex-1 overflow-x-auto overflow-y-hidden flex gap-5 pb-4 custom-scrollbar px-6 mt-4">
+        {steps.map(step => {
+          const stepTasks = filteredTasks.filter(t => t.board_step_id === step.id);
           return (
              <KanbanColumn 
-               key={col.title}
-               title={col.title}
-               color={col.color}
-               count={colConversations.length}
-               conversations={colConversations}
+               key={step.id}
+               title={step.name}
+               color={step.color || '#475569'}
+               count={stepTasks.length}
+               conversations={stepTasks} // reusando a variavel mas passando tasks
                baseUrl={configData?.baseURL}
                accountId={configData?.accountId}
              />

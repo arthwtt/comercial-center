@@ -1,7 +1,18 @@
 import React from 'react';
 import { RefreshCw, Filter, Clock } from 'lucide-react';
 
-export default function KanbanHeader({ agents = [], selectedAgent, setSelectedAgent, refreshInterval, setRefreshInterval, onManualRefresh, isFetching }) {
+export default function KanbanHeader({ 
+  agents = [], 
+  selectedAgent, 
+  setSelectedAgent, 
+  boards = [],
+  selectedBoardId,
+  setSelectedBoardId,
+  refreshInterval, 
+  setRefreshInterval, 
+  onManualRefresh, 
+  isFetching 
+}) {
   return (
     <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-6">
       <div>
@@ -10,6 +21,19 @@ export default function KanbanHeader({ agents = [], selectedAgent, setSelectedAg
       </div>
       
       <div className="flex flex-wrap items-center gap-3 bg-slate-800/40 p-2 rounded-2xl border border-slate-700/50 backdrop-blur-md">
+        
+        <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 rounded-xl border border-slate-700">
+          <select 
+            value={selectedBoardId}
+            onChange={(e) => setSelectedBoardId(e.target.value)}
+            className="bg-transparent text-sm font-bold text-orange-400 outline-none w-36 cursor-pointer"
+          >
+            {boards.length === 0 && <option value="">Sem Boards</option>}
+            {boards.map(b => (
+              <option key={b.id} value={b.id}>{b.name.toUpperCase()}</option>
+            ))}
+          </select>
+        </div>
         
         <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-900 rounded-xl border border-slate-700">
           <Filter className="w-4 h-4 text-slate-400" />
