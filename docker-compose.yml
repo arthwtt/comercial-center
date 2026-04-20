@@ -1,20 +1,15 @@
-version: "3.8"
-
 services:
   app:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: ${APP_IMAGE:-lead-mgmt:local}
     container_name: lead_mgmt_app
     restart: unless-stopped
     depends_on:
-      db:
+      commercial-center-db:
         condition: service_healthy
     environment:
       NODE_ENV: production
       PORT: 3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@db:5432/${POSTGRES_DB:-lead_mgmt}?schema=public
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@commercial-center-db:5432/${POSTGRES_DB:-lead_mgmt}?schema=public
       CHATWOOT_BASE_URL: ${CHATWOOT_BASE_URL:-}
       ACCOUNT_ID: ${ACCOUNT_ID:-}
       API_ACCESS_TOKEN: ${API_ACCESS_TOKEN:-}
@@ -24,9 +19,9 @@ services:
     networks:
       - interna
 
-  db:
+  commercial-center-db:
     image: postgres:15-alpine
-    container_name: lead_mgmt_postgres
+    container_name: commercial_center_db
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
