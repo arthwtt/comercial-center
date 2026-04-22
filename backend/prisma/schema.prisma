@@ -33,21 +33,82 @@ enum LeadOrigin {
   manual
 }
 
+enum DispatchStatus {
+  queued
+  processing
+  completed
+  completed_with_errors
+  failed
+}
+
+enum ImportBatchStatus {
+  queued
+  analyzing
+  processing
+  completed
+  failed
+}
+
+model ImportBatch {
+  id              String            @id @default(uuid())
+  name            String
+  source_file     String?
+  status          ImportBatchStatus @default(queued)
+  clear_before    Boolean           @default(false)
+  total_rows      Int               @default(0)
+  located_count   Int               @default(0)
+  processed_count Int               @default(0)
+  inserted_count  Int               @default(0)
+  skipped_count   Int               @default(0)
+  ignored_count   Int               @default(0)
+  error_message   String?
+  started_at      DateTime?
+  finished_at     DateTime?
+  created_at      DateTime          @default(now())
+  leads           LeadStaging[]
+
+  @@index([status])
+  @@index([created_at])
+}
+
 model LeadStaging {
-  id         String     @id @default(uuid())
-  name       String
-  email      String?
-  phone      String?
-  status     LeadStatus @default(pending)
-  origin     LeadOrigin @default(manual)
-  created_at DateTime   @default(now())
+  id                String     @id @default(uuid())
+  name              String
+  email             String?
+  phone             String?
+  batch_id          String?
+  identifier        String?
+  custom_attributes Json?
+  company           Json?
+  source_row        Json?
+  status            LeadStatus @default(pending)
+  origin            LeadOrigin @default(manual)
+  created_at        DateTime   @default(now())
+  batch             ImportBatch? @relation(fields: [batch_id], references: [id], onDelete: SetNull)
+
+  @@index([status])
+  @@index([email])
+  @@index([phone])
+  @@index([batch_id])
 }
 
 model Dispatch {
-  id              String   @id @default(uuid())
+  id              String         @id @default(uuid())
   admin_id        String?
   lead_count      Int
   target_agent_id Int?
   target_board_id String
-  created_at      DateTime @default(now())
+  target_step_id  String?
+  priority        String?
+  status          DispatchStatus @default(queued)
+  processed_count Int            @default(0)
+  success_count   Int            @default(0)
+  failed_count    Int            @default(0)
+  error_details   Json?
+  started_at      DateTime?
+  finished_at     DateTime?
+  created_at      DateTime       @default(now())
+
+  @@index([status])
+  @@index([created_at])
 }

@@ -10,21 +10,104 @@ const prisma = new PrismaClient();
 const chatwootService = require('../services/chatwoot');
 const { normalizeLeadInput } = require('../utils/leadNormalization');
 const { mapSpreadsheetLead } = require('../utils/spreadsheetLeadMapper');
-const { getLeadMetadata, saveLeadMetadata, clearAllMetadata } = require('../utils/stagingMetadata');
 const { readCommercialConfig } = require('../utils/commercialConfig');
 
 const uploadDir = require('os').tmpdir();
 const upload = multer({ dest: uploadDir });
 
 function sanitizeCustomAttributes(attributes = {}) {
+  if (!attributes || typeof attributes !== 'object' || Array.isArray(attributes)) {
+    return {};
+  }
+
   return Object.fromEntries(
     Object.entries(attributes).filter(([, value]) => value !== null && value !== undefined && value !== '')
   );
 }
 
-async function createStagingLeadFromInput(rawLead, origin = 'manual', metadata = null) {
+function normalizeBoolean(value) {
+  if (typeof value === 'boolean') {
+    return value;
+  }
+
+  return ['1', 'true', 'on', 'yes'].includes(String(value || '').trim().toLowerCase());
+}
+
+function deriveBatchName(fileName = '') {
+  const cleanName = String(fileName || '').trim();
+  if (!cleanName) {
+    return `Importacao ${new Date().toLocaleString('pt-BR')}`;
+  }
+
+  return cleanName.replace(/\.[^.]+$/, '') || cleanName;
+}
+
+function buildLeadRecordData(normalizedLead, origin = 'manual', metadata = null, status = 'pending', batchId = null) {
+  const customAttributes = sanitizeCustomAttributes(metadata?.customAttributes);
+  const company = sanitizeCustomAttributes(metadata?.company || customAttributes);
+
+  return {
+    name: normalizedLead.name,
+    email: normalizedLead.email,
+    phone: normalizedLead.phone,
+    batch_id: batchId,
+    identifier: metadata?.identifier || null,
+    custom_attributes: customAttributes,
+    company,
+    source_row: metadata?.sourceRow || null,
+    status,
+    origin,
+  };
+}
+
+function formatLeadRecord(lead) {
+  const customAttributes = sanitizeCustomAttributes(lead.custom_attributes);
+  const company = sanitizeCustomAttributes(lead.company || customAttributes);
+
+  return {
+    ...lead,
+    batchId: lead.batch_id || null,
+    identifier: lead.identifier || null,
+    customAttributes,
+    company,
+    sourceRow: lead.source_row || null,
+  };
+}
+
+function formatImportBatch(batch) {
+  const locatedCount = Number(batch.located_count || 0);
+  const processedCount = Number(batch.processed_count || 0);
+  const progressPercent = locatedCount > 0
+    ? Math.min(100, Math.round((processedCount / locatedCount) * 100))
+    : ['completed', 'failed'].includes(batch.status)
+      ? 100
+      : 0;
+
+  return {
+    ...batch,
+    progressPercent,
+    leadCount: batch._count?.leads || 0,
+  };
+}
+
+function buildLeadDataForDispatch(lead) {
+  const formattedLead = formatLeadRecord(lead);
+
+  return {
+    name: formattedLead.name,
+    phone: formattedLead.phone,
+    email: formattedLead.email,
+    origin: formattedLead.origin,
+    identifier: formattedLead.identifier,
+    customAttributes: formattedLead.customAttributes,
+  };
+}
+
+async function createStagingLeadFromInput(rawLead, origin = 'manual', metadata = null, options = {}) {
   const normalized = normalizeLeadInput(rawLead);
   const identifier = metadata?.identifier || null;
+  const shouldCheckRemoteDuplicates = Boolean(options.checkRemoteDuplicates);
+
   if (!normalized.name) {
     return { inserted: false, skipped: true, reason: 'missing_name' };
   }
@@ -47,31 +130,31 @@ async function createStagingLeadFromInput(rawLead, origin = 'manual', metadata =
       ? await prisma.leadStaging.findFirst({ where: { OR: localDuplicateWhere } })
       : null;
 
-    const existing = await chatwootService.findExistingContact({
-      phone: normalized.phone,
-      email: normalized.email,
-      identifier,
-      name: normalized.name,
-      includeName: false,
-    });
-    isDuplicate = Boolean(existingLocal || existing);
+    let existingRemote = null;
+    if (shouldCheckRemoteDuplicates) {
+      existingRemote = await chatwootService.findExistingContact({
+        phone: normalized.phone,
+        email: normalized.email,
+        identifier,
+        name: normalized.name,
+        includeName: false,
+      });
+    }
+
+    isDuplicate = Boolean(existingLocal || existingRemote);
   } catch (_error) {
     isDuplicate = false;
   }
 
   const createdLead = await prisma.leadStaging.create({
-    data: {
-      name: normalized.name,
-      email: normalized.email,
-      phone: normalized.phone,
-      status: isDuplicate ? 'skipped' : 'pending',
+    data: buildLeadRecordData(
+      normalized,
       origin,
-    }
+      metadata || { identifier },
+      isDuplicate ? 'skipped' : 'pending',
+      options.batchId || null
+    ),
   });
-
-  if (metadata) {
-    saveLeadMetadata(createdLead.id, metadata);
-  }
 
   return {
     inserted: !isDuplicate,
@@ -104,41 +187,339 @@ async function parseSpreadsheetFile(file) {
   return parseCsvFile(file.path);
 }
 
-// POST /api/leads/import
-router.post('/import', upload.single('file'), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: 'Arquivo .xlsx ou .csv obrigatório sob a tag "file"' });
+function buildImportMetadata(mappedLead) {
+  const customAttributes = sanitizeCustomAttributes(mappedLead.customAttributes);
+  return {
+    identifier: mappedLead.identifier,
+    customAttributes,
+    company: customAttributes,
+    sourceRow: mappedLead.sourceRow,
+  };
+}
+
+function chunk(items, size) {
+  const chunks = [];
+
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
   }
 
+  return chunks;
+}
+
+async function findExistingLeadsForImport(phones = [], emails = []) {
+  const existingPhones = new Set();
+  const existingEmails = new Set();
+
+  for (const phoneChunk of chunk(phones.filter(Boolean), 5000)) {
+    const existingByPhone = await prisma.leadStaging.findMany({
+      where: { phone: { in: phoneChunk } },
+      select: { phone: true },
+    });
+
+    existingByPhone.forEach((lead) => {
+      if (lead.phone) {
+        existingPhones.add(lead.phone);
+      }
+    });
+  }
+
+  for (const emailChunk of chunk(emails.filter(Boolean), 5000)) {
+    const existingByEmail = await prisma.leadStaging.findMany({
+      where: { email: { in: emailChunk } },
+      select: { email: true },
+    });
+
+    existingByEmail.forEach((lead) => {
+      if (lead.email) {
+        existingEmails.add(lead.email);
+      }
+    });
+  }
+
+  return { existingPhones, existingEmails };
+}
+
+async function updateImportBatchProgress(batchId, payload) {
+  await prisma.importBatch.update({
+    where: { id: batchId },
+    data: payload,
+  });
+}
+
+async function processImportBatch(batchId, file) {
   try {
-    const rows = await parseSpreadsheetFile(req.file);
-    fs.unlinkSync(req.file.path);
+    await updateImportBatchProgress(batchId, {
+      status: 'analyzing',
+      started_at: new Date(),
+    });
 
-    let inserted = 0;
-    let skipped = 0;
+    const rows = await parseSpreadsheetFile(file);
+    const totalRows = rows.length;
+    const mappedRows = rows.map((row) => {
+      const mappedLead = mapSpreadsheetLead(row);
+      return {
+        mappedLead,
+        normalizedLead: normalizeLeadInput(mappedLead),
+      };
+    });
 
-    for (const row of rows) {
-      try {
-        const mapped = mapSpreadsheetLead(row);
-        const result = await createStagingLeadFromInput(
-          mapped,
+    const validRows = mappedRows.filter(({ normalizedLead }) => (
+      Boolean(normalizedLead.name && (normalizedLead.phone || normalizedLead.email))
+    ));
+    const locatedCount = validRows.length;
+    const ignoredCount = totalRows - locatedCount;
+
+    await updateImportBatchProgress(batchId, {
+      status: 'processing',
+      total_rows: totalRows,
+      located_count: locatedCount,
+      ignored_count: ignoredCount,
+    });
+
+    const phones = Array.from(new Set(validRows.map(({ normalizedLead }) => normalizedLead.phone).filter(Boolean)));
+    const emails = Array.from(new Set(validRows.map(({ normalizedLead }) => normalizedLead.email).filter(Boolean)));
+    const { existingPhones, existingEmails } = await findExistingLeadsForImport(phones, emails);
+    const seenPhones = new Set();
+    const seenEmails = new Set();
+    const createBuffer = [];
+    let processedCount = 0;
+    let insertedCount = 0;
+    let skippedCount = 0;
+
+    for (const { mappedLead, normalizedLead } of validRows) {
+      const isDuplicate = Boolean(
+        (normalizedLead.phone && (existingPhones.has(normalizedLead.phone) || seenPhones.has(normalizedLead.phone))) ||
+        (normalizedLead.email && (existingEmails.has(normalizedLead.email) || seenEmails.has(normalizedLead.email)))
+      );
+
+      if (normalizedLead.phone) {
+        seenPhones.add(normalizedLead.phone);
+      }
+      if (normalizedLead.email) {
+        seenEmails.add(normalizedLead.email);
+      }
+
+      createBuffer.push(
+        buildLeadRecordData(
+          normalizedLead,
           'csv',
-          {
-            identifier: mapped.identifier,
-            customAttributes: sanitizeCustomAttributes(mapped.customAttributes),
-            company: sanitizeCustomAttributes(mapped.customAttributes),
-            sourceRow: mapped.sourceRow,
-          }
-        );
+          buildImportMetadata(mappedLead),
+          isDuplicate ? 'skipped' : 'pending',
+          batchId
+        )
+      );
 
-        if (result.inserted) inserted++;
-        if (result.skipped) skipped++;
-      } catch (_error) {
-        skipped++;
+      processedCount += 1;
+      if (isDuplicate) {
+        skippedCount += 1;
+      } else {
+        insertedCount += 1;
+      }
+
+      if (createBuffer.length >= 25) {
+        const data = createBuffer.splice(0, createBuffer.length);
+        await prisma.leadStaging.createMany({ data });
+        await updateImportBatchProgress(batchId, {
+          processed_count: processedCount,
+          inserted_count: insertedCount,
+          skipped_count: skippedCount,
+        });
       }
     }
 
-    res.json({ success: true, metrics: { inserted, skipped } });
+    if (createBuffer.length) {
+      await prisma.leadStaging.createMany({ data: createBuffer });
+    }
+
+    await updateImportBatchProgress(batchId, {
+      status: 'completed',
+      processed_count: processedCount,
+      inserted_count: insertedCount,
+      skipped_count: skippedCount,
+      finished_at: new Date(),
+    });
+  } catch (error) {
+    await updateImportBatchProgress(batchId, {
+      status: 'failed',
+      error_message: error.message,
+      finished_at: new Date(),
+    });
+  } finally {
+    if (file?.path && fs.existsSync(file.path)) {
+      fs.unlinkSync(file.path);
+    }
+  }
+}
+
+async function processDispatch(dispatchId, { leadIds, boardId, stepId, assigneeId, priority }) {
+  try {
+    await prisma.dispatch.update({
+      where: { id: dispatchId },
+      data: {
+        status: 'processing',
+        started_at: new Date(),
+      },
+    });
+
+    const pendingLeads = await prisma.leadStaging.findMany({
+      where: {
+        id: { in: leadIds },
+        status: 'pending',
+      },
+    });
+
+    const pendingLeadMap = new Map(pendingLeads.map((lead) => [lead.id, lead]));
+    const successfulLeadIds = [];
+    const errors = [];
+    let processedCount = 0;
+    let successCount = 0;
+    let failedCount = 0;
+
+    for (const leadId of leadIds) {
+      const lead = pendingLeadMap.get(leadId);
+
+      if (!lead) {
+        processedCount += 1;
+        failedCount += 1;
+        errors.push({
+          id: leadId,
+          name: 'Lead indisponivel',
+          reason: 'Lead nao encontrado no staging pendente.',
+        });
+      } else {
+        try {
+          const assigneeIds = assigneeId ? [Number(assigneeId)] : [];
+          await chatwootService.createLeadInChatwootFlow(
+            buildLeadDataForDispatch(lead),
+            boardId,
+            stepId,
+            assigneeIds,
+            priority
+          );
+
+          successfulLeadIds.push(lead.id);
+          processedCount += 1;
+          successCount += 1;
+        } catch (err) {
+          processedCount += 1;
+          failedCount += 1;
+          errors.push({
+            id: lead.id,
+            name: lead.name,
+            reason: err.message,
+          });
+        }
+      }
+
+      await prisma.dispatch.update({
+        where: { id: dispatchId },
+        data: {
+          processed_count: processedCount,
+          success_count: successCount,
+          failed_count: failedCount,
+          error_details: errors,
+        },
+      });
+    }
+
+    if (successfulLeadIds.length) {
+      await prisma.leadStaging.updateMany({
+        where: { id: { in: successfulLeadIds } },
+        data: { status: 'dispatched' },
+      });
+    }
+
+    await prisma.dispatch.update({
+      where: { id: dispatchId },
+      data: {
+        status: failedCount
+          ? successCount
+            ? 'completed_with_errors'
+            : 'failed'
+          : 'completed',
+        processed_count: processedCount,
+        success_count: successCount,
+        failed_count: failedCount,
+        error_details: errors,
+        finished_at: new Date(),
+      },
+    });
+  } catch (error) {
+    await prisma.dispatch.update({
+      where: { id: dispatchId },
+      data: {
+        status: 'failed',
+        finished_at: new Date(),
+        error_details: [{ reason: error.message }],
+      },
+    });
+  }
+}
+
+// GET /api/leads/import-batches
+router.get('/import-batches', async (_req, res) => {
+  try {
+    const batches = await prisma.importBatch.findMany({
+      orderBy: { created_at: 'desc' },
+      include: {
+        _count: {
+          select: { leads: true },
+        },
+      },
+    });
+
+    res.json({ success: true, data: batches.map(formatImportBatch) });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/leads/import
+router.post('/import', upload.single('file'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'Arquivo .xlsx ou .csv obrigatorio sob a tag "file"' });
+  }
+
+  const clearBeforeImport = normalizeBoolean(req.body?.clearBeforeImport);
+  const importName = String(req.body?.listName || '').trim() || deriveBatchName(req.file.originalname);
+
+  try {
+    if (clearBeforeImport) {
+      await prisma.leadStaging.deleteMany({});
+      await prisma.dispatch.deleteMany({});
+      await prisma.importBatch.deleteMany({});
+    }
+
+    const importBatch = await prisma.importBatch.create({
+      data: {
+        name: importName,
+        source_file: req.file.originalname || null,
+        clear_before: clearBeforeImport,
+        status: 'queued',
+      },
+    });
+
+    setImmediate(() => {
+      void processImportBatch(importBatch.id, {
+        path: req.file.path,
+        originalname: req.file.originalname,
+      });
+    });
+
+    res.json({
+      success: true,
+      queued: true,
+      batch: formatImportBatch(importBatch),
+      metrics: {
+        inserted: 0,
+        skipped: 0,
+        ignored: 0,
+        located: 0,
+        total_rows: 0,
+      },
+      message: `Importacao ${importBatch.id.slice(0, 8)} enfileirada para processamento.`,
+    });
   } catch (e) {
     if (req.file?.path && fs.existsSync(req.file.path)) {
       fs.unlinkSync(req.file.path);
@@ -150,7 +531,7 @@ router.post('/import', upload.single('file'), async (req, res) => {
 // POST /api/leads/manual
 router.post('/manual', async (req, res) => {
   try {
-    const result = await createStagingLeadFromInput(req.body || {}, 'manual');
+    const result = await createStagingLeadFromInput(req.body || {}, 'manual', null, { checkRemoteDuplicates: true });
     res.json({ success: true, data: result });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -160,22 +541,38 @@ router.post('/manual', async (req, res) => {
 // GET /api/leads/staging
 router.get('/staging', async (req, res) => {
   try {
-    const { status } = req.query;
-    const params = { orderBy: { created_at: 'desc' } };
-    if (status) params.where = { status };
+    const { status, batchId, page = 1, pageSize = 60 } = req.query;
+    const where = {};
+    const parsedPage = Math.max(1, Number(page) || 1);
+    const parsedPageSize = Math.min(120, Math.max(1, Number(pageSize) || 60));
 
-    const leads = await prisma.leadStaging.findMany(params);
-    const enrichedLeads = leads.map((lead) => {
-      const metadata = getLeadMetadata(lead.id) || {};
-      return {
-        ...lead,
-        identifier: metadata.identifier || null,
-        customAttributes: metadata.customAttributes || {},
-        company: metadata.company || metadata.customAttributes || {},
-        sourceRow: metadata.sourceRow || null,
-      };
+    if (status) {
+      where.status = status;
+    }
+    if (batchId) {
+      where.batch_id = String(batchId);
+    }
+
+    const [total, leads] = await prisma.$transaction([
+      prisma.leadStaging.count({ where }),
+      prisma.leadStaging.findMany({
+        where,
+        orderBy: { created_at: 'desc' },
+        skip: (parsedPage - 1) * parsedPageSize,
+        take: parsedPageSize,
+      }),
+    ]);
+
+    res.json({
+      success: true,
+      data: leads.map(formatLeadRecord),
+      meta: {
+        page: parsedPage,
+        pageSize: parsedPageSize,
+        total,
+        totalPages: Math.max(1, Math.ceil(total / parsedPageSize)),
+      },
     });
-    res.json({ success: true, data: enrichedLeads });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -187,7 +584,7 @@ router.post('/reset', async (req, res) => {
 
   try {
     await prisma.leadStaging.deleteMany({});
-    clearAllMetadata();
+    await prisma.importBatch.deleteMany({});
 
     if (includeDispatches) {
       await prisma.dispatch.deleteMany({});
@@ -196,8 +593,8 @@ router.post('/reset', async (req, res) => {
     res.json({
       success: true,
       message: includeDispatches
-        ? 'Staging, metadados e histórico de lotes limpos.'
-        : 'Staging e metadados limpos.',
+        ? 'Staging, importacoes e historico de lotes limpos.'
+        : 'Staging e importacoes limpos.',
     });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
@@ -209,98 +606,71 @@ router.post('/dispatch', async (req, res) => {
   const commercialConfig = readCommercialConfig();
   const {
     leadIds,
+    batchId,
+    amount,
     boardId = commercialConfig.boardId || 5,
     stepId = commercialConfig.stepLeadNovoId || 22,
     assigneeId,
-    priority = 'high'
+    priority = 'high',
   } = req.body;
-  if (!leadIds || !leadIds.length) {
-    return res.status(400).json({ error: 'Faltam leadIds obrigatórios' });
-  }
 
   const parsedBoardId = Number(boardId);
   const parsedStepId = Number(stepId);
+  const parsedAmount = Math.max(1, Number(amount) || 1);
 
   if (!Number.isFinite(parsedBoardId) || !Number.isFinite(parsedStepId)) {
-    return res.status(400).json({ error: 'boardId e stepId devem ser números válidos' });
+    return res.status(400).json({ error: 'boardId e stepId devem ser numeros validos' });
   }
 
   try {
+    let targetLeadIds = Array.isArray(leadIds) ? leadIds.filter(Boolean) : [];
+
+    if (!targetLeadIds.length) {
+      const leadsToDispatch = await prisma.leadStaging.findMany({
+        where: {
+          status: 'pending',
+          ...(batchId ? { batch_id: String(batchId) } : {}),
+        },
+        orderBy: { created_at: 'desc' },
+        take: parsedAmount,
+        select: { id: true },
+      });
+
+      targetLeadIds = leadsToDispatch.map((lead) => lead.id);
+    }
+
+    if (!targetLeadIds.length) {
+      return res.status(400).json({ error: 'Nenhum lead pendente encontrado para dispatch.' });
+    }
+
     const dispatchEntry = await prisma.dispatch.create({
       data: {
         admin_id: 'auto-ui',
-        lead_count: leadIds.length,
+        lead_count: targetLeadIds.length,
         target_board_id: String(parsedBoardId),
+        target_step_id: String(parsedStepId),
         target_agent_id: assigneeId ? Number(assigneeId) : null,
-      }
+        priority,
+        status: 'queued',
+      },
     });
 
-    const contactsCreated = [];
-    const errors = [];
-
-    for (const id of leadIds) {
-      const lead = await prisma.leadStaging.findUnique({ where: { id } });
-      if (!lead || lead.status !== 'pending') continue;
-
-      try {
-        const metadata = getLeadMetadata(id) || {};
-        const leadData = {
-          name: lead.name,
-          phone: lead.phone,
-          email: lead.email,
-          origin: lead.origin,
-          identifier: metadata.identifier || null,
-          customAttributes: metadata.customAttributes || {},
-        };
-
-        const assigneeIds = assigneeId ? [Number(assigneeId)] : [];
-        const result = await chatwootService.createLeadInChatwootFlow(
-          leadData,
-          parsedBoardId,
-          parsedStepId,
-          assigneeIds,
-          priority
-        );
-
-        contactsCreated.push({
-          leadId: id,
-          contactId: result.contact.id,
-          taskId: result.task.id,
-          name: lead.name,
-          contactCreated: result.contactCreated,
-          taskCreated: result.taskCreated
-        });
-      } catch (err) {
-        errors.push({ id, name: lead.name, reason: err.message });
-      }
-    }
-
-    let successCount = 0;
-    if (contactsCreated.length) {
-      // Atualizar status dos leads criados com sucesso
-      const successfulLeadIds = contactsCreated.map(item => item.leadId);
-      await prisma.leadStaging.updateMany({
-        where: { id: { in: successfulLeadIds } },
-        data: { status: 'dispatched' }
+    setImmediate(() => {
+      void processDispatch(dispatchEntry.id, {
+        leadIds: targetLeadIds,
+        boardId: parsedBoardId,
+        stepId: parsedStepId,
+        assigneeId,
+        priority,
       });
-      successCount = successfulLeadIds.length;
-    }
+    });
 
     res.json({
       success: true,
+      queued: true,
       dispatch_id: dispatchEntry.id,
-      metrics: { success: successCount, failed: errors.length },
-      leads_processed: contactsCreated,
-      errors,
-      mode: 'chatwoot_direct_with_kanban',
-      board_id: parsedBoardId,
-      step_id: parsedStepId,
-      success_message: successCount
-        ? `Criados ${successCount} lead(s) com tarefa(s) no Kanban.`
-        : 'Nenhum lead foi processado.',
-      failure_message: errors.length
-        ? `Falha no processamento de ${errors.length} lead(s).`
-        : '',
+      status: dispatchEntry.status,
+      message: `Lote ${dispatchEntry.id.split('-')[0]} enfileirado para processamento em segundo plano.`,
     });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
