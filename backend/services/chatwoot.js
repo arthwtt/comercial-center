@@ -171,6 +171,12 @@ class ChatwootService {
     return new Set((values || []).filter(Boolean).map((value) => String(value)));
   }
 
+  _sanitizeObject(payload = {}) {
+    return Object.fromEntries(
+      Object.entries(payload).filter(([, value]) => value !== null && value !== undefined && value !== '')
+    );
+  }
+
   _normalizeTask(task, stepsById) {
     const assignedAgents = Array.isArray(task.assigned_agents) ? task.assigned_agents : [];
     const contacts = Array.isArray(task.contacts) ? task.contacts : [];
@@ -308,11 +314,12 @@ class ChatwootService {
     }
   }
 
-  async findExistingContact({ phone, email, name }) {
+  async findExistingContact({ phone, email, identifier, name, includeName = false }) {
     const queries = [
       normalizePhoneBR(phone),
       normalizeEmail(email),
-      String(name || '').trim(),
+      String(identifier || '').replace(/\D/g, ''),
+      includeName ? String(name || '').trim() : '',
     ].filter(Boolean);
 
     for (const query of queries) {
@@ -328,6 +335,34 @@ class ChatwootService {
     }
 
     return null;
+  }
+
+  _buildContactAdditionalAttributes(leadData = {}) {
+    const customAttributes = leadData.customAttributes || {};
+    const location = [customAttributes.cidade, customAttributes.uf].filter(Boolean).join('/');
+
+    return this._sanitizeObject({
+      origem_lead: leadData.origin || 'spreadsheet',
+      nome_empresa: customAttributes.razao_social || customAttributes.nome_fantasia || null,
+      razao_social: customAttributes.razao_social || null,
+      nome_fantasia: customAttributes.nome_fantasia || null,
+      cnpj: customAttributes.cnpj || null,
+      cidade_uf: location || null,
+      endereco: customAttributes.endereco || null,
+      bairro: customAttributes.bairro || null,
+      cep: customAttributes.cep || null,
+      ramo: customAttributes.ramo_principal || null,
+      porte: customAttributes.porte_empresa || null,
+      faturamento: customAttributes.faturamento_estimado || null,
+      quadro_funcionarios: customAttributes.quadro_funcionarios || null,
+      regime_tributario: customAttributes.regime_tributario || null,
+      natureza_juridica: customAttributes.natureza_juridica || null,
+      capital_social: customAttributes.capital_social || null,
+      site: customAttributes.site || null,
+      nome_socio: customAttributes.nome_socio || null,
+      situacao_cadastral: customAttributes.situacao_cadastral || null,
+      matriz_filial: customAttributes.matriz_filial || null,
+    });
   }
 
   // --- M2/M3: STAGING & BOARDS DISPATCH --- //
@@ -354,17 +389,22 @@ class ChatwootService {
 
   async resolveDefaultInboxId() {
     const envInboxId = Number(process.env.DEFAULT_INBOX_ID || 0);
+    console.log(`[ChatwootService] DEFAULT_INBOX_ID from env: ${envInboxId}`);
     if (Number.isFinite(envInboxId) && envInboxId > 0) {
+      console.log(`[ChatwootService] Using env inbox: ${envInboxId}`);
       return envInboxId;
     }
 
     const configInboxId = Number(readCommercialConfig()?.defaultInboxId || 0);
     if (Number.isFinite(configInboxId) && configInboxId > 0) {
+      console.log(`[ChatwootService] Using config inbox: ${configInboxId}`);
       return configInboxId;
     }
 
+    console.log(`[ChatwootService] Fetching inboxes from API...`);
     const inboxes = await this.getInboxes();
     const firstInboxId = Number(inboxes?.[0]?.id || 0);
+    console.log(`[ChatwootService] Found inboxes: ${inboxes?.length}, using: ${firstInboxId}`);
     return Number.isFinite(firstInboxId) && firstInboxId > 0 ? firstInboxId : null;
   }
 
@@ -383,7 +423,9 @@ class ChatwootService {
      const existingContact = await this.findExistingContact({
        phone: normalizedPhone,
        email: normalizedEmail,
+       identifier: leadData.identifier || null,
        name: leadData.name,
+       includeName: false,
      });
      
      // Passo 1: Criar/Buscar Contato
@@ -394,15 +436,25 @@ class ChatwootService {
          throw new Error('Nenhum inbox do Chatwoot dispon?vel para criar o contato. Configure DEFAULT_INBOX_ID ou verifique os inboxes da conta.');
        }
 
-        const contactRes = await axios.post(`/api/v1/accounts/${actId}/contacts`, {
-          inbox_id: inboxId,
-          name: leadData.name,
-          email: normalizedEmail,
-          phone_number: normalizedPhone,
-          identifier: leadData.identifier || null,
-          custom_attributes: leadData.customAttributes || {}
-        }, cfg);
-       contact = this._firstItem(contactRes.data) || contactRes.data?.payload?.contact || contactRes.data?.payload || contactRes.data;
+       try {
+         const contactRes = await axios.post(`/api/v1/accounts/${actId}/contacts`, {
+           inbox_id: inboxId,
+           name: leadData.name,
+           email: normalizedEmail,
+           phone_number: normalizedPhone,
+           identifier: leadData.identifier || null,
+           custom_attributes: leadData.customAttributes || {}
+         }, cfg);
+         contact = this._firstItem(contactRes.data) || contactRes.data?.payload?.contact || contactRes.data?.payload || contactRes.data;
+       } catch (error) {
+         if (error.response) {
+           error.response.data = {
+             ...(error.response.data || {}),
+             description: `Falha ao criar contato no Chatwoot. ${error.response.data?.description || ''}`.trim()
+           };
+         }
+         this.handleError(error);
+       }
      }
 
      if (!contact?.id) {
@@ -425,10 +477,228 @@ class ChatwootService {
         taskPayload.task.assigned_agent_ids = [Number(assigneeId)];
      }
 
-     const taskRes = await axios.post(`/api/v1/accounts/${actId}/kanban/tasks`, taskPayload, cfg);
-     const task = taskRes.data;
+     let task;
+     try {
+       const taskRes = await axios.post(`/api/v1/accounts/${actId}/kanban/tasks`, taskPayload, cfg);
+       task = taskRes.data;
+     } catch (error) {
+       if (error.response) {
+         error.response.data = {
+           ...(error.response.data || {}),
+           description: `Falha ao criar task no board ${parsedBoardId} / etapa ${parsedStepId}. ${error.response.data?.description || ''}`.trim()
+         };
+       }
+       this.handleError(error);
+     }
 
      return { contact, task };
+  }
+
+  /**
+   * Criar apenas contato no Chatwoot (sem tarefa no kanban)
+   * Usado para migrar do sistema de webhook para criação direta
+   */
+  async createContactOnly(leadData) {
+    const cfg = this._getAxiosConfig();
+    const actId = process.env.ACCOUNT_ID;
+    const normalizedPhone = normalizePhoneBR(leadData.phone);
+    const normalizedEmail = normalizeEmail(leadData.email);
+
+    // Verificar se contato já existe
+    const existingContact = await this.findExistingContact({
+      phone: normalizedPhone,
+      email: normalizedEmail,
+      identifier: leadData.identifier || null,
+      name: leadData.name,
+      includeName: false,
+    });
+
+    if (existingContact) {
+      return { contact: existingContact, created: false };
+    }
+
+    // Resolver inbox padrão
+    const inboxId = await this.resolveDefaultInboxId();
+    if (!inboxId) {
+      throw new Error('Nenhum inbox do Chatwoot disponível para criar o contato. Configure DEFAULT_INBOX_ID ou verifique os inboxes da conta.');
+    }
+
+    console.log(`[ChatwootService] Criando contato com inbox_id=${inboxId} para ${leadData.name}`);
+
+    const additionalAttributes = this._buildContactAdditionalAttributes(leadData);
+
+    // Payload para API do Chatwoot
+    const contactPayload = {
+      inbox_id: inboxId,
+      name: leadData.name,
+      email: normalizedEmail,
+      phone_number: normalizedPhone,
+      blocked: false,
+      identifier: leadData.identifier || null,
+      additional_attributes: additionalAttributes,
+      custom_attributes: {}
+    };
+
+    try {
+      const contactRes = await axios.post(`/api/v1/accounts/${actId}/contacts`, contactPayload, cfg);
+      const contact = this._firstItem(contactRes.data) || contactRes.data?.payload?.contact || contactRes.data?.payload || contactRes.data;
+
+      if (!contact?.id) {
+        throw new Error('Chatwoot não retornou um contato válido.');
+      }
+
+      return { contact, created: true };
+    } catch (error) {
+      if (error.response) {
+        error.response.data = {
+          ...(error.response.data || {}),
+          description: `Falha ao criar contato no Chatwoot. ${error.response.data?.description || ''}`.trim()
+        };
+      }
+      this.handleError(error);
+    }
+  }
+
+  /**
+   * Formata atributos adicionais em texto para descrição da tarefa
+   */
+  _formatAttributesForDescription(leadData = {}) {
+    const customAttributes = leadData.customAttributes || {};
+    const lines = [];
+    
+    if (customAttributes.razao_social) {
+      lines.push(`Razao social: ${customAttributes.razao_social}`);
+    }
+    if (customAttributes.nome_fantasia) {
+      lines.push(`Nome fantasia: ${customAttributes.nome_fantasia}`);
+    }
+    if (customAttributes.cnpj) {
+      lines.push(`CNPJ: ${customAttributes.cnpj}`);
+    }
+    if (leadData.email) {
+      lines.push(`Email: ${leadData.email}`);
+    }
+    if (leadData.phone) {
+      lines.push(`Telefone: ${leadData.phone}`);
+    }
+    if (customAttributes.cidade && customAttributes.uf) {
+      lines.push(`Localizacao: ${customAttributes.cidade}/${customAttributes.uf}`);
+    } else if (customAttributes.cidade) {
+      lines.push(`Cidade: ${customAttributes.cidade}`);
+    }
+    if (customAttributes.endereco) {
+      lines.push(`Endereco: ${customAttributes.endereco}`);
+    }
+    if (customAttributes.cep) {
+      lines.push(`CEP: ${customAttributes.cep}`);
+    }
+    if (customAttributes.ramo_principal) {
+      lines.push(`Ramo: ${customAttributes.ramo_principal}`);
+    }
+    if (customAttributes.porte_empresa) {
+      lines.push(`Porte: ${customAttributes.porte_empresa}`);
+    }
+    if (customAttributes.faturamento_estimado) {
+      lines.push(`Faturamento: ${customAttributes.faturamento_estimado}`);
+    }
+    if (customAttributes.quadro_funcionarios) {
+      lines.push(`Funcionarios: ${customAttributes.quadro_funcionarios}`);
+    }
+    if (customAttributes.regime_tributario) {
+      lines.push(`Regime tributario: ${customAttributes.regime_tributario}`);
+    }
+    if (customAttributes.natureza_juridica) {
+      lines.push(`Natureza juridica: ${customAttributes.natureza_juridica}`);
+    }
+    if (customAttributes.site) {
+      lines.push(`Site: ${customAttributes.site}`);
+    }
+    if (customAttributes.situacao_cadastral) {
+      lines.push(`Situacao cadastral: ${customAttributes.situacao_cadastral}`);
+    }
+    if (leadData.origin) {
+      lines.push(`Origem: ${leadData.origin}`);
+    }
+
+    return lines.join('\n') || 'Sem informacoes adicionais';
+  }
+
+  /**
+   * Criar tarefa no kanban do Chatwoot
+   */
+  async createTaskInKanban(contactId, leadData, boardId, boardStepId, assigneeIds = [], priority = 'high') {
+    const cfg = this._getAxiosConfig();
+    const actId = process.env.ACCOUNT_ID;
+    const parsedBoardId = Number(boardId);
+    const parsedBoardStepId = Number(boardStepId);
+
+    if (!Number.isFinite(parsedBoardId) || !Number.isFinite(parsedBoardStepId)) {
+      throw new Error('Board ou etapa invalidos para criar a task no Chatwoot.');
+    }
+
+    const description = this._formatAttributesForDescription(leadData);
+
+    // Validar prioridade
+    const validPriorities = ['urgent', 'high', 'medium', 'low'];
+    const sanitizedPriority = validPriorities.includes(priority) ? priority : 'high';
+
+    const taskPayload = {
+      task: {
+        title: leadData.name,
+        description,
+        priority: sanitizedPriority,
+        board_id: parsedBoardId,
+        board_step_id: parsedBoardStepId,
+        contact_ids: [contactId]
+      }
+    };
+
+    if (Array.isArray(assigneeIds) && assigneeIds.length > 0) {
+      taskPayload.task.assigned_agent_ids = assigneeIds.map(id => Number(id));
+    }
+
+    try {
+      const taskRes = await axios.post(`/api/v1/accounts/${actId}/kanban/tasks`, taskPayload, cfg);
+      const task = this._firstItem(taskRes.data) || taskRes.data?.payload?.task || taskRes.data?.payload || taskRes.data;
+
+      if (!task?.id) {
+        throw new Error('Chatwoot não retornou uma tarefa válida.');
+      }
+
+      return { task, created: true };
+    } catch (error) {
+      if (error.response) {
+        error.response.data = {
+          ...(error.response.data || {}),
+          description: `Falha ao criar tarefa no kanban (board ${parsedBoardId} / step ${parsedBoardStepId}). ${error.response.data?.description || ''}`.trim()
+        };
+      }
+      this.handleError(error);
+    }
+  }
+
+  /**
+   * Fluxo completo: criar contato + criar tarefa no kanban
+   * Usado no dispatch direto para Chatwoot
+   */
+  async createLeadInChatwootFlow(leadData, boardId, boardStepId, assigneeIds = [], priority = 'high') {
+    // Passo 1: Criar contato
+    const contactResult = await this.createContactOnly(leadData);
+    const contact = contactResult.contact;
+
+    if (!contact?.id) {
+      throw new Error('Falha ao criar contato para o lead.');
+    }
+
+    // Passo 2: Criar tarefa no kanban
+    const taskResult = await this.createTaskInKanban(contact.id, leadData, boardId, boardStepId, assigneeIds, priority);
+
+    return {
+      contact,
+      task: taskResult.task,
+      contactCreated: contactResult.created,
+      taskCreated: taskResult.created
+    };
   }
 
   // --- MÓDULO OPN: REPORTS V2 --- //

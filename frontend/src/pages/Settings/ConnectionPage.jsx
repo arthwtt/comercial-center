@@ -12,6 +12,15 @@ import {
 } from 'lucide-react';
 import api from '../../services/api';
 
+const TOKEN_MASK = '••••••••••••••••';
+
+const EMPTY_CONNECTION = {
+  baseURL: '',
+  accountId: '',
+  token: '',
+  defaultInboxId: '',
+};
+
 const EMPTY_MAPPING = {
   boardId: '',
   stepLeadNovoId: '',
@@ -37,7 +46,8 @@ const STEP_FIELDS = [
 ];
 
 export default function ConnectionPage() {
-  const [formData, setFormData] = useState({ baseURL: '', accountId: '', token: '' });
+  const [formData, setFormData] = useState(EMPTY_CONNECTION);
+  const [loadedConnection, setLoadedConnection] = useState(EMPTY_CONNECTION);
   const [mapping, setMapping] = useState(EMPTY_MAPPING);
   const [boards, setBoards] = useState([]);
   const [status, setStatus] = useState('idle');
@@ -59,16 +69,23 @@ export default function ConnectionPage() {
       const res = await api.get('/config/status');
       if (!res.data.configured) {
         setCurrentConnection('none');
+        setLoadedConnection(EMPTY_CONNECTION);
         return;
       }
 
       if (res.data.active) {
+        const nextConnection = {
+          baseURL: String(res.data.baseURL || ''),
+          accountId: String(res.data.accountId || ''),
+          token: TOKEN_MASK,
+          defaultInboxId: String(res.data.defaultInboxId || ''),
+        };
+
         setCurrentConnection('active');
-        setFormData({
-          baseURL: res.data.baseURL,
-          accountId: res.data.accountId,
-          token: '••••••••••••••••',
-        });
+        setFormData(nextConnection);
+        setLoadedConnection(nextConnection);
+        setStatus('success');
+        setErrorMsg('');
         await loadBoards();
         return;
       }
@@ -103,10 +120,29 @@ export default function ConnectionPage() {
   );
 
   const availableSteps = selectedBoard?.steps || [];
+  const isMaskedToken = formData.token === TOKEN_MASK;
+  const credentialsChanged = (
+    formData.baseURL !== loadedConnection.baseURL ||
+    formData.accountId !== loadedConnection.accountId ||
+    (!isMaskedToken && formData.token !== '')
+  );
+  const onlyInboxChanged = (
+    currentConnection === 'active' &&
+    !credentialsChanged &&
+    formData.defaultInboxId !== loadedConnection.defaultInboxId
+  );
+  const canSaveConnection = status === 'success' || onlyInboxChanged;
+  const canSaveAnything = Boolean(mapping.boardId) || canSaveConnection || currentConnection === 'active';
 
   const handleChange = (event) => {
     const { name, value } = event.target;
     setFormData((prev) => ({ ...prev, [name]: value }));
+
+    if (name === 'defaultInboxId' && currentConnection === 'active' && !credentialsChanged) {
+      setErrorMsg('');
+      return;
+    }
+
     setStatus('idle');
   };
 
@@ -134,8 +170,22 @@ export default function ConnectionPage() {
   };
 
   const handleTest = async () => {
-    if (!formData.baseURL || !formData.accountId || !formData.token) {
-      setErrorMsg('Preencha Base URL, Account ID e token antes de testar.');
+    const unchangedMaskedConnection = (
+      currentConnection === 'active' &&
+      isMaskedToken &&
+      formData.baseURL === loadedConnection.baseURL &&
+      formData.accountId === loadedConnection.accountId
+    );
+
+    if (unchangedMaskedConnection) {
+      setStatus('success');
+      setErrorMsg('');
+      await loadBoards();
+      return;
+    }
+
+    if (!formData.baseURL || !formData.accountId || !formData.token || isMaskedToken) {
+      setErrorMsg('Informe o token real para testar alterações de conexão.');
       setStatus('error');
       return;
     }
@@ -153,12 +203,26 @@ export default function ConnectionPage() {
   };
 
   const handleSave = async () => {
+    if (!canSaveConnection && credentialsChanged) {
+      setErrorMsg('Teste a conexão com o token real antes de salvar alterações de credenciais.');
+      setStatus('error');
+      return;
+    }
+
     setIsSaving(true);
     try {
-      const shouldSaveConnection = status === 'success';
+      if (canSaveConnection) {
+        const connectionPayload = {
+          baseURL: formData.baseURL,
+          accountId: formData.accountId,
+          defaultInboxId: formData.defaultInboxId,
+        };
 
-      if (shouldSaveConnection) {
-        await api.post('/config/save', formData);
+        if (!isMaskedToken && formData.token) {
+          connectionPayload.token = formData.token;
+        }
+
+        await api.post('/config/save', connectionPayload);
       }
 
       await api.post('/config/commercial-mapping', mapping);
@@ -243,6 +307,21 @@ export default function ConnectionPage() {
                 onChange={handleChange}
                 placeholder="Profile Settings > Access Token"
                 className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-200 outline-none transition focus:border-amber-500"
+              />
+            </label>
+
+            <label className="space-y-2 md:col-span-2">
+              <span className="flex items-center gap-2 text-sm text-slate-300">
+                <Flag className="h-4 w-4 text-emerald-400" />
+                Default Inbox ID
+              </span>
+              <input
+                type="number"
+                name="defaultInboxId"
+                value={formData.defaultInboxId}
+                onChange={handleChange}
+                placeholder="2"
+                className="w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-slate-200 outline-none transition focus:border-emerald-500"
               />
             </label>
           </div>
@@ -374,7 +453,7 @@ export default function ConnectionPage() {
             <button
               type="button"
               onClick={handleSave}
-              disabled={isSaving || (!mapping.boardId && status !== 'success')}
+              disabled={isSaving || !canSaveAnything}
               className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-3 text-sm font-medium text-white shadow-lg shadow-sky-500/20 transition hover:bg-sky-500 disabled:opacity-50"
             >
               <Save className="h-4 w-4" />

@@ -1,7 +1,29 @@
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { AlertTriangle, FileSpreadsheet, Send, Upload, UserPlus, X } from 'lucide-react';
+import { AlertTriangle, FileSpreadsheet, Send, Trash2, Upload, UserPlus, X } from 'lucide-react';
 import api from '../../services/api';
+
+function PreviewRow({ label, value }) {
+  if (!value) return null;
+  return (
+    <div>
+      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{label}</p>
+      <p className="mt-1 text-sm text-slate-200">{value}</p>
+    </div>
+  );
+}
+
+function JsonPreview({ value }) {
+  if (!value || !Object.keys(value).length) return null;
+  return (
+    <div>
+      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">Bloco empresa</p>
+      <pre className="mt-1 overflow-x-auto rounded-lg border border-slate-800 bg-slate-900/80 p-3 text-xs text-sky-100">
+        {JSON.stringify(value, null, 2)}
+      </pre>
+    </div>
+  );
+}
 
 export default function LeadsStaging() {
   const queryClient = useQueryClient();
@@ -11,9 +33,12 @@ export default function LeadsStaging() {
   const [targetBoard, setTargetBoard] = useState('');
   const [targetStep, setTargetStep] = useState('');
   const [targetAgent, setTargetAgent] = useState('');
+  const [priority, setPriority] = useState('high');
   const [dispatchResult, setDispatchResult] = useState(null);
+  const [dispatchErrors, setDispatchErrors] = useState([]);
   const [showManualForm, setShowManualForm] = useState(false);
   const [manualData, setManualData] = useState({ name: '', phone: '', email: '' });
+  const [clearBeforeImport, setClearBeforeImport] = useState(true);
 
   const { data: stagingData } = useQuery({
     queryKey: ['leads_staging', 'pending'],
@@ -24,10 +49,18 @@ export default function LeadsStaging() {
   });
 
   const { data: boardsData } = useQuery({
-    queryKey: ['system_boards'],
+    queryKey: ['boards-preview'],
     queryFn: async () => {
-      const res = await api.get('/boards');
-      return res.data.data;
+      const res = await api.get('/config/boards-preview');
+      return res.data.data || [];
+    }
+  });
+
+  const { data: mappingData } = useQuery({
+    queryKey: ['commercial-mapping'],
+    queryFn: async () => {
+      const res = await api.get('/config/commercial-mapping');
+      return res.data.data || {};
     }
   });
 
@@ -39,8 +72,29 @@ export default function LeadsStaging() {
     }
   });
 
+  const { data: dispatchesData } = useQuery({
+    queryKey: ['dispatches'],
+    queryFn: async () => {
+      const res = await api.get('/dispatches');
+      return res.data.data || [];
+    }
+  });
+
+  useEffect(() => {
+    if (!mappingData) return;
+    if (!targetBoard && mappingData.boardId) {
+      setTargetBoard(String(mappingData.boardId));
+    }
+    if (!targetStep && mappingData.stepLeadNovoId) {
+      setTargetStep(String(mappingData.stepLeadNovoId));
+    }
+  }, [mappingData, targetBoard, targetStep]);
+
   const uploadMutation = useMutation({
-    mutationFn: async (formData) => {
+    mutationFn: async ({ formData, clearBeforeImport: shouldClearBeforeImport }) => {
+      if (shouldClearBeforeImport) {
+        await api.post('/leads/reset', { includeDispatches: true });
+      }
       const res = await api.post('/leads/import', formData, {
         headers: { 'Content-Type': 'multipart/form-data' }
       });
@@ -52,7 +106,24 @@ export default function LeadsStaging() {
       queryClient.invalidateQueries({ queryKey: ['leads_staging'] });
     },
     onError: (err) => {
-      setUploadStatus('Erro ao importar CSV: ' + err.message);
+      setUploadStatus('Erro ao importar planilha: ' + err.message);
+    }
+  });
+
+  const resetMutation = useMutation({
+    mutationFn: async () => {
+      const res = await api.post('/leads/reset', { includeDispatches: true });
+      return res.data;
+    },
+    onSuccess: (data) => {
+      setDispatchErrors([]);
+      setDispatchResult(null);
+      setUploadStatus(data.message || 'Staging limpo com sucesso.');
+      queryClient.invalidateQueries({ queryKey: ['leads_staging'] });
+      queryClient.invalidateQueries({ queryKey: ['dispatches'] });
+    },
+    onError: (err) => {
+      setUploadStatus('Erro ao limpar staging: ' + err.message);
     }
   });
 
@@ -75,43 +146,61 @@ export default function LeadsStaging() {
       return res.data;
     },
     onSuccess: (data) => {
-      const errorPreview = (data.errors || [])
-        .slice(0, 3)
-        .map((item) => `${item.name}: ${item.reason}`)
-        .join(' | ');
-      setDispatchResult(
-        `Lote ${data.dispatch_id.split('-')[0]} disparado: ${data.metrics.success} sucesso(s), ${data.metrics.failed} falha(s).` +
-        (errorPreview ? ` ${errorPreview}` : '')
-      );
+      setDispatchErrors(data.errors || []);
+      setDispatchResult([
+        `Lote ${data.dispatch_id.split('-')[0]} processado com criacao direta no Chatwoot.`,
+        data.success_message,
+        data.failure_message,
+        `Resultado: ${data.metrics.success} sucesso(s), ${data.metrics.failed} falha(s).`
+      ].filter(Boolean).join(' '));
       queryClient.invalidateQueries({ queryKey: ['leads_staging'] });
+      queryClient.invalidateQueries({ queryKey: ['dispatches'] });
     },
     onError: (err) => {
       setDispatchResult('Erro crítico: ' + err.message);
+      setDispatchErrors([]);
     }
   });
 
   const handleUpload = () => {
     if (!file) return;
-    setUploadStatus('Importando, normalizando telefone e validando duplicatas...');
+    setUploadStatus(
+      clearBeforeImport
+        ? 'Limpando staging antigo, importando planilha e carregando metadados dos leads...'
+        : 'Importando, normalizando telefone e validando duplicatas...'
+    );
     const fd = new FormData();
     fd.append('file', file);
-    uploadMutation.mutate(fd);
+    uploadMutation.mutate({ formData: fd, clearBeforeImport });
+  };
+
+  const handleReset = () => {
+    const confirmed = window.confirm(
+      'Isso vai limpar o staging local, os metadados e o histórico de lotes. Deseja continuar?'
+    );
+
+    if (!confirmed) return;
+    resetMutation.mutate();
   };
 
   const handleDispatch = () => {
     if (!targetBoard || !targetStep || !stagingData?.length) return;
-    const idsToDispatch = stagingData.slice(0, dispatchAmount).map((lead) => lead.id);
+    const exactAmount = Math.max(1, Math.min(Number(dispatchAmount || 1), stagingData.length));
+    const idsToDispatch = stagingData.slice(0, exactAmount).map((lead) => lead.id);
+    setDispatchErrors([]);
     setDispatchResult('Iniciando dispatcher...');
     dispatchMutation.mutate({
       leadIds: idsToDispatch,
       boardId: targetBoard,
       stepId: targetStep,
       assigneeId: targetAgent || null,
+      priority,
     });
   };
 
   const pendingCount = stagingData?.length || 0;
   const currentBoard = boardsData?.find((board) => String(board.id) === String(targetBoard));
+  const previewLeads = useMemo(() => stagingData || [], [stagingData]);
 
   return (
     <div className="max-w-6xl mx-auto p-4 md:p-8 space-y-8 animate-fade-in relative">
@@ -159,7 +248,7 @@ export default function LeadsStaging() {
         <div>
           <h1 className="text-3xl font-bold text-white">Staging & Dispatch</h1>
           <p className="text-slate-400 mt-2">
-            Carregue a base, normalize os contatos e só então dispare para agente e funil.
+            Carregue a base, revise o staging e só então dispare para o Chatwoot.
           </p>
         </div>
         <button
@@ -177,7 +266,7 @@ export default function LeadsStaging() {
           <div>
             <h3 className="text-lg font-semibold text-slate-200">Importação em lote</h3>
             <p className="mt-1 max-w-[260px] text-sm text-slate-500">
-              Telefones são normalizados para `+55...` e a base é cruzada com duplicatas antes de entrar no staging.
+              Telefones são normalizados para `+55...`, o nome segue fallback e a base é validada antes de entrar no staging.
             </p>
           </div>
 
@@ -198,15 +287,36 @@ export default function LeadsStaging() {
           </label>
 
           {file && (
-            <button
-              onClick={handleUpload}
-              disabled={uploadMutation.isPending}
-              className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-2.5 font-medium text-white shadow-lg shadow-blue-500/20 hover:bg-blue-500"
-            >
-              <Upload className="w-4 h-4" />
-              Enviar arquivo
-            </button>
+            <>
+              <label className="flex items-center gap-2 text-sm text-slate-300">
+                <input
+                  type="checkbox"
+                  checked={clearBeforeImport}
+                  onChange={(e) => setClearBeforeImport(e.target.checked)}
+                  className="h-4 w-4 rounded border-slate-600 bg-slate-900"
+                />
+                Limpar staging e lotes antes de importar
+              </label>
+
+              <button
+                onClick={handleUpload}
+                disabled={uploadMutation.isPending || resetMutation.isPending}
+                className="flex items-center gap-2 rounded-xl bg-blue-600 px-6 py-2.5 font-medium text-white shadow-lg shadow-blue-500/20 hover:bg-blue-500"
+              >
+                <Upload className="w-4 h-4" />
+                Enviar arquivo
+              </button>
+            </>
           )}
+
+          <button
+            onClick={handleReset}
+            disabled={resetMutation.isPending || uploadMutation.isPending}
+            className="flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-5 py-2.5 text-sm text-rose-100 transition-colors hover:bg-rose-500/20 disabled:opacity-50"
+          >
+            <Trash2 className="w-4 h-4" />
+            Limpar staging
+          </button>
 
           {uploadStatus && (
             <div className="rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-sm text-slate-300">
@@ -220,7 +330,7 @@ export default function LeadsStaging() {
 
           <h3 className="mb-6 flex items-center gap-2 text-lg font-semibold text-slate-200">
             <Send className="w-5 h-5 text-orange-400" />
-            Motor de dispatch
+            Motor de dispatch direto
           </h3>
 
           <div className="mb-6 flex items-center gap-4">
@@ -237,13 +347,13 @@ export default function LeadsStaging() {
                 <span className="font-bold">{Math.min(dispatchAmount, pendingCount)} leads</span>
               </div>
               <input
-                type="range"
+                type="number"
                 min="1"
                 max={Math.max(pendingCount, 1)}
                 disabled={pendingCount === 0}
                 value={Math.min(dispatchAmount, pendingCount)}
-                onChange={(e) => setDispatchAmount(Number(e.target.value))}
-                className="w-full cursor-pointer accent-orange-500"
+                onChange={(e) => setDispatchAmount(Number(e.target.value || 1))}
+                className="w-full rounded-lg border border-slate-700 bg-slate-800 p-2 text-sm text-slate-200 outline-none"
               />
             </div>
           </div>
@@ -295,6 +405,25 @@ export default function LeadsStaging() {
             </select>
           </div>
 
+          <div className="mb-6">
+            <label className="text-xs font-bold uppercase text-slate-500">4. Prioridade da task</label>
+            <select
+              value={priority}
+              onChange={(e) => setPriority(e.target.value)}
+              disabled={pendingCount === 0}
+              className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-800 p-2 text-sm text-slate-200 outline-none"
+            >
+              <option value="urgent">Urgente</option>
+              <option value="high">Alta</option>
+              <option value="medium">Média</option>
+              <option value="low">Baixa</option>
+            </select>
+          </div>
+
+          <div className="mb-6 rounded-xl border border-sky-500/20 bg-sky-500/5 p-3 text-sm text-sky-100">
+            Cada lead selecionado vira um contato no Chatwoot e, em seguida, uma task no board e step escolhidos acima.
+          </div>
+
           <button
             onClick={handleDispatch}
             disabled={!targetBoard || !targetStep || pendingCount === 0 || dispatchMutation.isPending}
@@ -308,19 +437,103 @@ export default function LeadsStaging() {
           </button>
 
           {dispatchResult && (
-            <div className="mt-3 rounded-lg bg-black/20 p-2 text-center text-xs font-medium text-slate-400">
+            <div className="mt-3 rounded-lg bg-black/20 p-3 text-sm text-slate-300">
               {dispatchResult}
             </div>
           )}
         </div>
       </div>
 
+      {!!dispatchErrors.length && (
+        <section className="rounded-2xl border border-rose-500/20 bg-rose-500/5 p-4">
+          <h3 className="text-sm font-semibold uppercase tracking-[0.18em] text-rose-200">Falhas do último dispatch</h3>
+          <div className="mt-4 space-y-3">
+            {dispatchErrors.map((item) => (
+              <div key={item.id} className="rounded-xl border border-rose-500/20 bg-slate-950/40 p-3">
+                <p className="font-medium text-white">{item.name}</p>
+                <p className="mt-1 text-sm text-rose-200">{item.reason}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section className="rounded-2xl border border-slate-700 bg-slate-900/80 p-6">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-semibold text-white">Leads no staging</h2>
+            <p className="mt-1 text-sm text-slate-400">
+              Esta é a prévia do que foi gravado na base antes de subir para o Chatwoot.
+            </p>
+          </div>
+          <div className="rounded-full border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200">
+            {previewLeads.length} lead(s)
+          </div>
+        </div>
+
+        <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {previewLeads.map((lead) => (
+            <div key={lead.id} className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+              <p className="text-lg font-semibold text-white">{lead.name}</p>
+              <div className="mt-4 grid gap-3">
+                <PreviewRow label="Telefone" value={lead.phone} />
+                <PreviewRow label="Email" value={lead.email} />
+                <PreviewRow label="CNPJ" value={lead.identifier} />
+                <PreviewRow label="Razão social" value={lead.customAttributes?.razao_social} />
+                <PreviewRow label="Fantasia" value={lead.customAttributes?.nome_fantasia} />
+                <PreviewRow label="Cidade / UF" value={[lead.customAttributes?.cidade, lead.customAttributes?.uf].filter(Boolean).join(' / ')} />
+                <PreviewRow label="Ramo" value={lead.customAttributes?.ramo_principal} />
+                <PreviewRow label="Porte" value={lead.customAttributes?.porte_empresa} />
+                <JsonPreview value={lead.company || lead.customAttributes} />
+              </div>
+            </div>
+          ))}
+
+          {!previewLeads.length && (
+            <div className="col-span-full rounded-2xl border border-dashed border-slate-700 bg-slate-950/35 p-6 text-center text-sm text-slate-400">
+              Nenhum lead pendente no staging.
+            </div>
+          )}
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-slate-700 bg-slate-900/80 p-6">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-semibold text-white">Últimos lotes</h2>
+            <p className="mt-1 text-sm text-slate-400">
+              Histórico básico dos envios processados pelo Commercial Center.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-6 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {(dispatchesData || []).map((dispatch) => (
+            <div key={dispatch.id} className="rounded-2xl border border-slate-800 bg-slate-950/40 p-4">
+              <p className="text-sm font-semibold text-white">Lote {dispatch.id.slice(0, 8)}</p>
+              <div className="mt-4 grid gap-3">
+                <PreviewRow label="Leads" value={dispatch.lead_count} />
+                <PreviewRow label="Board" value={dispatch.target_board_id} />
+                <PreviewRow label="Agente" value={dispatch.target_agent_id || 'Sem agente fixo'} />
+                <PreviewRow label="Criado em" value={new Date(dispatch.created_at).toLocaleString('pt-BR')} />
+              </div>
+            </div>
+          ))}
+
+          {!(dispatchesData || []).length && (
+            <div className="col-span-full rounded-2xl border border-dashed border-slate-700 bg-slate-950/35 p-6 text-center text-sm text-slate-400">
+              Nenhum lote registrado ainda.
+            </div>
+          )}
+        </div>
+      </section>
+
       <div className="rounded-2xl border border-amber-500/20 bg-amber-500/5 p-4 text-sm text-amber-100">
         <div className="flex items-start gap-3">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-300" />
           <p>
-            Fluxo atual: `contato para task com nome do contato e agente opcional`. Isso já permite subir CSV,
-            armazenar no staging e despachar em lote para um funil/etapa/agente escolhidos pelo administrador.
+            Se vier `404`, normalmente o board/step não existe na instância do Chatwoot usada pelo backend. Se vier `422`,
+            normalmente o contato ou a task foi rejeitado por dado inválido ou payload incompatível.
           </p>
         </div>
       </div>

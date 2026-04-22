@@ -24,11 +24,11 @@ COPY --from=backend-builder --chown=node:node /app/backend /app/backend
 COPY --from=frontend-builder --chown=node:node /app/frontend/dist /app/frontend/dist
 COPY --chown=node:node docker/entrypoint.sh /entrypoint.sh
 
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 USER node
 WORKDIR /app/backend
 
 EXPOSE 3000
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["sh", "/entrypoint.sh"]

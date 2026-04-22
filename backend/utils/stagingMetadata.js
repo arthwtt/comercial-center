@@ -39,7 +39,19 @@ function getLeadMetadata(leadId) {
   return store[String(leadId)] || null;
 }
 
+function clearLeadMetadata(leadId) {
+  const store = readStore();
+  delete store[String(leadId)];
+  writeStore(store);
+}
+
+function clearAllMetadata() {
+  writeStore({});
+}
+
 module.exports = {
   saveLeadMetadata,
   getLeadMetadata,
+  clearLeadMetadata,
+  clearAllMetadata,
 };

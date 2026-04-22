@@ -10,7 +10,8 @@ const prisma = new PrismaClient();
 const chatwootService = require('../services/chatwoot');
 const { normalizeLeadInput } = require('../utils/leadNormalization');
 const { mapSpreadsheetLead } = require('../utils/spreadsheetLeadMapper');
-const { getLeadMetadata, saveLeadMetadata } = require('../utils/stagingMetadata');
+const { getLeadMetadata, saveLeadMetadata, clearAllMetadata } = require('../utils/stagingMetadata');
+const { readCommercialConfig } = require('../utils/commercialConfig');
 
 const uploadDir = require('os').tmpdir();
 const upload = multer({ dest: uploadDir });
@@ -23,6 +24,7 @@ function sanitizeCustomAttributes(attributes = {}) {
 
 async function createStagingLeadFromInput(rawLead, origin = 'manual', metadata = null) {
   const normalized = normalizeLeadInput(rawLead);
+  const identifier = metadata?.identifier || null;
   if (!normalized.name) {
     return { inserted: false, skipped: true, reason: 'missing_name' };
   }
@@ -32,13 +34,27 @@ async function createStagingLeadFromInput(rawLead, origin = 'manual', metadata =
   }
 
   let isDuplicate = false;
+  const localDuplicateWhere = [];
+  if (normalized.phone) {
+    localDuplicateWhere.push({ phone: normalized.phone });
+  }
+  if (normalized.email) {
+    localDuplicateWhere.push({ email: normalized.email });
+  }
+
   try {
+    const existingLocal = localDuplicateWhere.length
+      ? await prisma.leadStaging.findFirst({ where: { OR: localDuplicateWhere } })
+      : null;
+
     const existing = await chatwootService.findExistingContact({
       phone: normalized.phone,
       email: normalized.email,
+      identifier,
       name: normalized.name,
+      includeName: false,
     });
-    isDuplicate = Boolean(existing);
+    isDuplicate = Boolean(existingLocal || existing);
   } catch (_error) {
     isDuplicate = false;
   }
@@ -110,6 +126,7 @@ router.post('/import', upload.single('file'), async (req, res) => {
           {
             identifier: mapped.identifier,
             customAttributes: sanitizeCustomAttributes(mapped.customAttributes),
+            company: sanitizeCustomAttributes(mapped.customAttributes),
             sourceRow: mapped.sourceRow,
           }
         );
@@ -148,7 +165,40 @@ router.get('/staging', async (req, res) => {
     if (status) params.where = { status };
 
     const leads = await prisma.leadStaging.findMany(params);
-    res.json({ success: true, data: leads });
+    const enrichedLeads = leads.map((lead) => {
+      const metadata = getLeadMetadata(lead.id) || {};
+      return {
+        ...lead,
+        identifier: metadata.identifier || null,
+        customAttributes: metadata.customAttributes || {},
+        company: metadata.company || metadata.customAttributes || {},
+        sourceRow: metadata.sourceRow || null,
+      };
+    });
+    res.json({ success: true, data: enrichedLeads });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// POST /api/leads/reset
+router.post('/reset', async (req, res) => {
+  const { includeDispatches = true } = req.body || {};
+
+  try {
+    await prisma.leadStaging.deleteMany({});
+    clearAllMetadata();
+
+    if (includeDispatches) {
+      await prisma.dispatch.deleteMany({});
+    }
+
+    res.json({
+      success: true,
+      message: includeDispatches
+        ? 'Staging, metadados e histórico de lotes limpos.'
+        : 'Staging e metadados limpos.',
+    });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }
@@ -156,9 +206,23 @@ router.get('/staging', async (req, res) => {
 
 // POST /api/leads/dispatch
 router.post('/dispatch', async (req, res) => {
-  const { leadIds, boardId, stepId, assigneeId } = req.body;
-  if (!leadIds || !leadIds.length || !boardId || !stepId) {
-    return res.status(400).json({ error: 'Faltam propriedades obrigatórias (leadIds, boardId, stepId)' });
+  const commercialConfig = readCommercialConfig();
+  const {
+    leadIds,
+    boardId = commercialConfig.boardId || 5,
+    stepId = commercialConfig.stepLeadNovoId || 22,
+    assigneeId,
+    priority = 'high'
+  } = req.body;
+  if (!leadIds || !leadIds.length) {
+    return res.status(400).json({ error: 'Faltam leadIds obrigatórios' });
+  }
+
+  const parsedBoardId = Number(boardId);
+  const parsedStepId = Number(stepId);
+
+  if (!Number.isFinite(parsedBoardId) || !Number.isFinite(parsedStepId)) {
+    return res.status(400).json({ error: 'boardId e stepId devem ser números válidos' });
   }
 
   try {
@@ -166,12 +230,12 @@ router.post('/dispatch', async (req, res) => {
       data: {
         admin_id: 'auto-ui',
         lead_count: leadIds.length,
-        target_board_id: String(boardId),
+        target_board_id: String(parsedBoardId),
         target_agent_id: assigneeId ? Number(assigneeId) : null,
       }
     });
 
-    let successCount = 0;
+    const contactsCreated = [];
     const errors = [];
 
     for (const id of leadIds) {
@@ -180,27 +244,63 @@ router.post('/dispatch', async (req, res) => {
 
       try {
         const metadata = getLeadMetadata(id) || {};
-        await chatwootService.createLeadFlow({
-          ...lead,
+        const leadData = {
+          name: lead.name,
+          phone: lead.phone,
+          email: lead.email,
+          origin: lead.origin,
           identifier: metadata.identifier || null,
           customAttributes: metadata.customAttributes || {},
-        }, boardId, stepId, assigneeId);
+        };
 
-        await prisma.leadStaging.update({
-          where: { id },
-          data: { status: 'dispatched' }
+        const assigneeIds = assigneeId ? [Number(assigneeId)] : [];
+        const result = await chatwootService.createLeadInChatwootFlow(
+          leadData,
+          parsedBoardId,
+          parsedStepId,
+          assigneeIds,
+          priority
+        );
+
+        contactsCreated.push({
+          leadId: id,
+          contactId: result.contact.id,
+          taskId: result.task.id,
+          name: lead.name,
+          contactCreated: result.contactCreated,
+          taskCreated: result.taskCreated
         });
-        successCount++;
       } catch (err) {
         errors.push({ id, name: lead.name, reason: err.message });
       }
+    }
+
+    let successCount = 0;
+    if (contactsCreated.length) {
+      // Atualizar status dos leads criados com sucesso
+      const successfulLeadIds = contactsCreated.map(item => item.leadId);
+      await prisma.leadStaging.updateMany({
+        where: { id: { in: successfulLeadIds } },
+        data: { status: 'dispatched' }
+      });
+      successCount = successfulLeadIds.length;
     }
 
     res.json({
       success: true,
       dispatch_id: dispatchEntry.id,
       metrics: { success: successCount, failed: errors.length },
+      leads_processed: contactsCreated,
       errors,
+      mode: 'chatwoot_direct_with_kanban',
+      board_id: parsedBoardId,
+      step_id: parsedStepId,
+      success_message: successCount
+        ? `Criados ${successCount} lead(s) com tarefa(s) no Kanban.`
+        : 'Nenhum lead foi processado.',
+      failure_message: errors.length
+        ? `Falha no processamento de ${errors.length} lead(s).`
+        : '',
     });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });

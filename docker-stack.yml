@@ -1,20 +1,20 @@
 services:
   app:
-    image: lead-mgmt
+    image: ${APP_IMAGE:-lead-mgmt:latest}
     environment:
       NODE_ENV: production
       PORT: 3000
-      DATABASE_URL: postgresql://postgres:password@commercial-center-db:5432/lead_mgmt?schema=public
-      CHATWOOT_BASE_URL: ""
-      ACCOUNT_ID: ""
-      API_ACCESS_TOKEN: ""
-      DEFAULT_INBOX_ID: ""
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-password}@commercial-center-db:5432/${POSTGRES_DB:-lead_mgmt}?schema=public
+      CHATWOOT_BASE_URL: ${CHATWOOT_BASE_URL:-}
+      ACCOUNT_ID: ${ACCOUNT_ID:-}
+      API_ACCESS_TOKEN: ${API_ACCESS_TOKEN:-}
+      DEFAULT_INBOX_ID: ${DEFAULT_INBOX_ID:-}
     networks:
       - interna
       - externa
     deploy:
       mode: replicated
-      replicas: 1
+      replicas: ${APP_REPLICAS:-1}
       placement:
         constraints:
           - node.role == manager
@@ -23,18 +23,18 @@ services:
       labels:
         traefik.enable: "true"
         traefik.docker.network: "externa"
-        traefik.http.routers.lead-mgmt.rule: "Host(`app.seudominio.com`)"
+        traefik.http.routers.lead-mgmt.rule: "Host(`${FRONTEND_HOST:-app.seudominio.com}`)"
         traefik.http.routers.lead-mgmt.entrypoints: "websecure"
         traefik.http.routers.lead-mgmt.tls: "true"
-        traefik.http.routers.lead-mgmt.tls.certresolver: "cf"
+        traefik.http.routers.lead-mgmt.tls.certresolver: "${TRAEFIK_CERTRESOLVER:-cf}"
         traefik.http.services.lead-mgmt.loadbalancer.server.port: "3000"
 
   commercial-center-db:
     image: postgres:15-alpine
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: lead_mgmt
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: ${POSTGRES_DB:-lead_mgmt}
     volumes:
       - pgdata:/var/lib/postgresql/data
     networks:
@@ -47,6 +47,12 @@ services:
           - node.role == manager
       restart_policy:
         condition: any
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-lead_mgmt}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
 volumes:
   pgdata:
